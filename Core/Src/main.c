@@ -62,7 +62,7 @@ float rpm2 = 0.0f;
 #define ANGLE_DT         0.005f
 #define VEL_DT           0.020f
 #define POS_DT           0.100f
-#define ENCODER_TO_CM 0.00827f
+#define ENCODER_TO_CM 0.01554059f
 volatile uint8_t  pwm_counter = 0;
 volatile uint8_t  motor1_thr = 0;     /* on-time in TIM4 ticks (0..PWM_STEPS) */
 volatile uint8_t  motor2_thr = 0;
@@ -91,18 +91,18 @@ typedef struct {
 } PID_t;
 
 /* inner: angle (deg) -> motor % ; derivative uses gyro rate directly */
-PID_t pid_ang = { 30.0f, 0.0f, 0.185f, 0.0f, 40.0f, 100.0f };
+PID_t pid_ang = { 30.0f, 0.2f, 0.19f, 0.0f, 40.0f, 100.0f };
 /* Cascade (position loop 10 Hz, speed loop 50 Hz, angle loop 200 Hz):
  *   position error (cm) --P--> speed setpoint (cm/s, clamped to vel_max)
  *   speed error (cm/s)  --PI-> angle setpoint (deg, clamped to ANGLE_SP_MAX)
  * The speed PI integrator also learns the true balance point, which removes the drift. */
-#define ANGLE_SP_MAX     2.6f
+#define ANGLE_SP_MAX     3.1f
 float pos_kp  = 1.0f;                 /* 1/s : speed setpoint per cm of error (tune: pp=) */
-float vel_max = 10.0f;                /* cm/s: max cruise speed toward target (tune: vm=) */
+float vel_max = 12.0f;                /* cm/s: max cruise speed toward target (tune: vm=) */
 float vel_sp  = 0.0f;
 float vel_now = 0.0f;                 /* low-pass filtered speed, cm/s */
 #define VEL_LPF          0.3f        /* 0..1, higher = less filtering */
-PID_t pid_vel = { 0.30f, 0.0f, 0.0f, 0.0f, ANGLE_SP_MAX, ANGLE_SP_MAX };
+PID_t pid_vel = { 0.14f, 0.05f, 0.0f, 0.0f, ANGLE_SP_MAX, ANGLE_SP_MAX };
 
 float angle_trim = 0.0f;              /* mechanical balance point offset (deg) */
 float angle_balance=0.0f;
@@ -120,6 +120,17 @@ uint8_t ctrl_enable = 1;
 uint8_t armed = 0;
 uint8_t tel_enable = 1;
 uint8_t tel_due = 0;
+
+/* ---------------- Remote drive (f/b/l/r/s/rp/spd/turn over UART2) ----------------
+ * Direction commands must be repeated < DRIVE_TIMEOUT_MS apart (ESP32 resends every 100 ms),
+ * otherwise the robot stops and holds its position (safe if Wi-Fi drops). */
+#define DRIVE_TIMEOUT_MS 500u
+#define TURN_SIGN        (1)          /* flip to -1 if left/right are swapped */
+volatile int8_t  drive_dir = 0;       /* +1 forward, -1 backward */
+volatile int8_t  turn_dir  = 0;       /* -1 left,   +1 right     */
+volatile uint32_t drive_last_ms = 0;
+float drive_speed = 8.0f;             /* cm/s while f/b held (spd=) */
+float turn_pwr    = 15.0f;            /* motor % added differentially (turn=) */
 
 /* ---------------- UART2 (non-blocking) ---------------- */
 #define TX_BUF_SIZE      512u
@@ -379,6 +390,31 @@ static void Cmd_Process(void)
         return;
     }
 
+    /* ---- remote drive commands (from the app via ESP32), silent: no reply ---- */
+    if (line[1] == 0 && strchr("fblrs", line[0]))
+    {
+        switch (line[0])
+        {
+            case 'f': drive_dir =  1; break;
+            case 'b': drive_dir = -1; break;
+            case 'l': turn_dir  = -1; break;
+            case 'r': turn_dir  =  1; break;
+            default:  drive_dir = 0; turn_dir = 0; break;   /* 's' */
+        }
+        drive_last_ms = HAL_GetTick();
+        cmd_ready = 0;
+        return;
+    }
+    if (strcmp(line, "rp") == 0)     /* reset position: here becomes 0 */
+    {
+        encoder1_count = 0;
+        encoder2_count = 0;
+        pos_now = 0.0f; pos_prev = 0.0f; pos_target = 0.0f;
+        vel_sp = 0.0f; vel_now = 0.0f;
+        cmd_ready = 0;
+        return;
+    }
+
     char *sep = strchr(line, '=');
     if (!sep) sep = strchr(line, ' ');
     if (!sep) { Uart_Write("ERR fmt\r\n", 9); cmd_ready = 0; return; }
@@ -395,6 +431,8 @@ static void Cmd_Process(void)
     if (strcmp(key, "en") == 0)       { ctrl_enable = (val != 0.0f); ok = 1; }
     else if (strcmp(key, "tel") == 0) { tel_enable  = (val != 0.0f); ok = 1; }
     else if (strcmp(key, "mv") == 0)  { pos_target = pos_now + val; ok = 1; }
+    else if (strcmp(key, "spd") == 0) { if (val < 0.0f) val = 0.0f; if (val > vel_max) val = vel_max; drive_speed = val; ok = 1; }
+    else if (strcmp(key, "turn") == 0){ if (val < 0.0f) val = 0.0f; if (val > 30.0f) val = 30.0f; turn_pwr = val; ok = 1; }
     else
     {
         for (unsigned i = 0; i < N_PARAMS; i++)
@@ -483,7 +521,18 @@ static void Control_Step(uint8_t run_vel, uint8_t run_pos)
     else
     {
         /* ---- 10 Hz: position P -> speed setpoint (saturated = constant-speed cruise) ---- */
-        if (run_pos)
+        if ((drive_dir || turn_dir) && (HAL_GetTick() - drive_last_ms) > DRIVE_TIMEOUT_MS)
+        {
+            drive_dir = 0; turn_dir = 0;                 /* command lost -> stop */
+            pos_target = pos_now;
+        }
+
+        if (drive_dir)
+        {
+            vel_sp = drive_dir * drive_speed;            /* manual drive: speed mode */
+            pos_target = pos_now;                        /* on release, hold where we are */
+        }
+        else if (run_pos)
         {
             vel_sp = pos_kp * (pos_target - pos_now);
             if (vel_sp >  vel_max) vel_sp =  vel_max;
@@ -502,7 +551,8 @@ static void Control_Step(uint8_t run_vel, uint8_t run_pos)
         /* ---- inner loop 200 Hz: angle -> motor ---- */
         motor_out = PID_Update(&pid_ang, angle_sp - angle_now, rate, ANGLE_DT);
         int16_t m = Apply_Deadzone(motor_out);
-        Motor_Set(MOTOR1_SIGN * m, MOTOR2_SIGN * m);
+        int16_t t = (int16_t)(TURN_SIGN * turn_dir * turn_pwr);
+        Motor_Set(MOTOR1_SIGN * (m + t), MOTOR2_SIGN * (m - t));
     }
 
     if (run_pos) tel_due = 1;
